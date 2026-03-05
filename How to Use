@@ -1,0 +1,48 @@
+# How to Use
+
+## Prerequisites
+
+- **Autodesk Revit 2024** (or later)
+- **pyRevit** installed and connected to Revit
+  - Download: https://github.com/pyrevitlabs/pyRevit/releases
+
+---
+
+## Setup
+
+### 1. Clone or Download this Repository
+
+```
+git clone https://github.com/wieglaf-folls/revit-tapered-beam-optimizer.git
+```
+
+Or download as ZIP and extract to any folder.
+
+---
+
+### 2. Load the Custom Family
+
+1. Open your Revit project
+2. Go to **Insert** tab → **Load Family**
+3. Navigate to the `families/` folder in this repository
+4. Select the `.rfa` file and click **Open**
+
+> ⚠️ The script will not work correctly without the custom family loaded.
+
+---
+
+### 3. Run the Script via pyRevit
+
+1. Open Revit with your project
+2. Go to the **pyRevit** tab in the Revit ribbon
+3. Click **pyRevit** → **Tools** → **Run Script**
+4. Navigate to the `src/` folder and select the script
+5. Click **Open** to execute
+
+---
+
+## Notes
+
+- Make sure the tapered beam elements are already placed in the model before running the script
+- The script processes all tapered beams in the active view
+- Check the output log in the pyRevit console for any warnings or errors
