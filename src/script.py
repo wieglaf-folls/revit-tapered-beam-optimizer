@@ -4,6 +4,7 @@ import traceback
 import math
 
 from Autodesk.Revit.DB import *
+from Autodesk.Revit.DB.Structure import StructuralFramingUtils
 from pyrevit import revit, forms
 
 # ============================================================
@@ -41,12 +42,16 @@ P_I_TAPER = u"i_taper_dist"
 P_I_CENTER    = u"i_center_offset"
 P_I_TAPER_OFF = u"i_taper_offset"
 P_I_COL_OFFSET = u"i_column_offset"
+P_J_COL_OFFSET = u"j_column_offset"
 
 P_JW_R2   = u"jw_R2"
 P_JW_L2   = u"jw_L2"
 P_J_TAPER = u"j_taper_dist"
 P_J_CENTER    = u"j_center_offset"
 P_J_TAPER_OFF = u"j_taper_offset"
+
+P_L_CENTER = u"L_center"
+P_L_FACE   = u"L_face"
 
 
 # ============================================================
@@ -323,6 +328,56 @@ def fmt_halves_origin(side, col, B, D, Bsrc, Dsrc):
         u"[{}] half_iw     = B/2 = {:.3f}/2 = {:.3f}mm".format(side, ft_to_mm(B), ft_to_mm(0.5*B)),
     ])
 
+def resolve_fukashi_names_by_ey(col, ey_axis, dbg=None, tag=""):
+    """
+    梁の +ey / -ey に対応するフカシパラメータ名を返す
+    戻り:
+        fL_name = 梁 +ey 側（L）
+        fR_name = 梁 -ey 側（R）
+    """
+    try:
+        tr = col.GetTransform()
+        cx = unit_xy(tr.BasisX)
+        cy = unit_xy(tr.BasisY)
+        ey = unit_xy(ey_axis)
+    except:
+        return None, None, u"GetTransform fail"
+
+    if cx is None or cy is None or ey is None:
+        return None, None, u"axis normalize fail"
+
+    # ey に一番近い軸を選ぶ
+    ax = abs(dot(cx, ey))
+    ay = abs(dot(cy, ey))
+
+    if ax >= ay:
+        axis = cx
+        pos_name = u"フカシ03"   # +X
+        neg_name = u"フカシ04"   # -X
+        axis_name = "X"
+    else:
+        axis = cy
+        pos_name = u"フカシ01"   # +Y
+        neg_name = u"フカシ02"   # -Y
+        axis_name = "Y"
+
+    s = dot(axis, ey)
+
+    if s >= 0:
+        fL_name = pos_name   # +ey 側
+        fR_name = neg_name
+    else:
+        fL_name = neg_name
+        fR_name = pos_name
+
+    if dbg:
+        dbg.section("fukashi.resolve")
+        dbg.set(tag+"axis_name", axis_name, 1)
+        dbg.set(tag+"dot(axis,ey)", fstr(s), 1)
+        dbg.set(tag+"fL_name", fL_name, 1)
+        dbg.set(tag+"fR_name", fR_name, 1)
+
+    return fL_name, fR_name, None
 
 def column_face_size_from_type(col, ey):
     """梁左右(ey)方向に見た柱の素の見かけ幅（フカシ無し）"""
@@ -359,7 +414,7 @@ def get_halves_center_and_iw_LR_with_fukashi(col, ey_axis, fL_name, fR_name, dbg
         return None, None, None, u"B/D not found"
 
     half_center = 0.5 * D
-    half_iw_base = 0.5 * B  # あなたの前提（iwはB）
+    half_iw_base = 0.5 * B 
 
     # フカシ（未設定なら0）
     fL = get_len_inst_or_type(col, fL_name) or 0.0
@@ -425,152 +480,81 @@ def get_halves_center_and_iw_LR_with_fukashi(col, ey_axis, fL_name, fR_name, dbg
 
 
 def col_hit_face_dist_along_u_Auto(col, uH, view, dbg=None, tag=""):
-    """
-    柱のローカルX面 or Y面のうち、梁方向uに対して「ちゃんと当たる面」を自動選択して
-    面までの距離t（u方向）を返す。
-    """
-    B, D, _, _ = get_col_bd(col)
+    B, D, Bsrc, Dsrc = get_col_bd(col)
     if B is None:
-        return None, u"B missing"
+        return None, None, None, u"B missing"
     if D is None:
         D = B
-
-    # フカシ（暫定：03/04を両面に流用）
-    fU  = get_len_inst_or_type(col, u"フカシ03") or 0.0
-    fDk = get_len_inst_or_type(col, u"フカシ04") or 0.0
 
     try:
         tr = col.GetTransform()
         cx = unit_xy(tr.BasisX)
         cy = unit_xy(tr.BasisY)
     except:
-        return None, u"GetTransform fail"
+        return None, None, None, u"GetTransform fail"
 
     u = unit_xy(uH)
     if cx is None or cy is None or u is None:
-        return None, u"axis normalize fail"
+        return None, None, None, u"axis normalize fail"
 
     ux = dot(u, cx)
     uy = dot(u, cy)
 
-    # ★当てる面を選ぶ（平行に近い方を避ける）
-    use_axis = "X" if abs(ux) >= abs(uy) else "Y"
-    n = cx if use_axis == "X" else cy
-    un = ux if use_axis == "X" else uy
+    if abs(ux) >= abs(uy):
+        use_axis = "X"
+        axis = cx
+        un = ux
+        half_dim = 0.5 * B
+        # X方向フカシ対応
+        # +X face -> フカシ04
+        # -X face -> フカシ03
+        f_pos_name = u"フカシ04" 
+        f_neg_name = u"フカシ03"
+    else:
+        use_axis = "Y"
+        axis = cy
+        un = uy
+        half_dim = 0.5 * D
+        f_pos_name = u"フカシ01"
+        f_neg_name = u"フカシ02"
 
-    # 寸法（X面ならB/2、Y面ならD/2 のつもり。逆ならここを入替）
-    half_dim = 0.5 * (B if use_axis == "X" else D)
-
-    # ほぼ平行なら失敗扱い
     if abs(un) < 0.02:
         if dbg:
             dbg.section("hit.auto")
             dbg.set(tag+"ux", fstr(ux), 1)
             dbg.set(tag+"uy", fstr(uy), 1)
             dbg.set(tag+"use_axis", use_axis, 1)
-        return None, u"u nearly parallel to {} face".format(use_axis)
+        return None, None, None, u"u nearly parallel to {} face".format(use_axis)
 
-    # view.Upでフカシの上下を決める（暫定ロジック踏襲）
-    vu = unit_xy(view.UpDirection)
-    if vu is None:
-        f_pos = 0.5*(fU + fDk)
-        f_neg = 0.5*(fU + fDk)
-    else:
-        if dot(n, vu) >= 0:
-            f_pos = fU
-            f_neg = fDk
-        else:
-            f_pos = fDk
-            f_neg = fU
+    f_pos = get_len_inst_or_type(col, f_pos_name) or 0.0
+    f_neg = get_len_inst_or_type(col, f_neg_name) or 0.0
 
-    addUD = (f_pos if un >= 0 else f_neg)
-    h = half_dim + addUD
+    add_face = f_pos if un >= 0 else f_neg
+    h = half_dim + add_face
     t = h / abs(un)
 
     if dbg:
         dbg.section("hit.auto")
-        dbg.set(tag+"use_axis", use_axis, 1)
+        dbg.set(tag+"Bsrc", Bsrc, 2)
+        dbg.set(tag+"Dsrc", Dsrc, 2)
         dbg.set(tag+"u", vstr(u), 2)
         dbg.set(tag+"cx", vstr(cx), 2)
         dbg.set(tag+"cy", vstr(cy), 2)
         dbg.set(tag+"ux", fstr(ux), 1)
         dbg.set(tag+"uy", fstr(uy), 1)
+        dbg.set(tag+"use_axis", use_axis, 1)
+        dbg.set(tag+"dot(axis,u)", fstr(un), 1)
+        dbg.set(tag+"f_pos_name", f_pos_name, 1)
+        dbg.set(tag+"f_neg_name", f_neg_name, 1)
+        dbg.set(tag+"f_pos_mm", fstr(ft_to_mm(f_pos)), 1)
+        dbg.set(tag+"f_neg_mm", fstr(ft_to_mm(f_neg)), 1)
         dbg.set(tag+"half_dim_mm", fstr(ft_to_mm(half_dim)), 1)
-        dbg.set(tag+"addUD_mm", fstr(ft_to_mm(addUD)), 1)
+        dbg.set(tag+"add_face_mm", fstr(ft_to_mm(add_face)), 1)
         dbg.set(tag+"h_mm", fstr(ft_to_mm(h)), 1)
         dbg.set(tag+"t_mm", fstr(ft_to_mm(t)), 1)
 
-    return t, None
+    return t, half_dim, add_face, None
 
-
-# def col_hit_face_dist_along_u_Yonly(col, uH, view, dbg=None, tag=""):
-#     """
-#     暫定仕様：柱の「Y面（BasisY方向の面）」だけでヒット距離を計算する。
-#     """
-#     B, D, _, _ = get_col_bd(col)
-#     if B is None:
-#         return None, u"B missing"
-#     if D is None:
-#         D = B
-
-#     fU  = get_len_inst_or_type(col, u"フカシ03") or 0.0
-#     fDk = get_len_inst_or_type(col, u"フカシ04") or 0.0
-
-#     try:
-#         tr = col.GetTransform()
-#         cy = unit_xy(tr.BasisY)
-#     except:
-#         return None, u"GetTransform fail"
-
-#     u = unit_xy(uH)
-#     if cy is None or u is None:
-#         return None, u"axis normalize fail"
-
-#     uy = dot(u, cy)
-
-#     # ★ここを現実的に：0.001とかでも割るとメートル級に暴走する
-#     # まずは閾値を緩く（例: cos(89deg)=0.017）して弾く
-#     if abs(uy) < 0.02:
-#         if dbg:
-#             dbg.section("hit.yonly")
-#             dbg.set(tag+"colId", col.Id.IntegerValue if col else None, 1)
-#             dbg.set(tag+"u", vstr(u), 2)
-#             dbg.set(tag+"cy", vstr(cy), 2)
-#             dbg.set(tag+"uy", fstr(uy), 1)
-#             dbg.set(tag+"B_mm", fstr(ft_to_mm(B)), 1)
-#             dbg.set(tag+"D_mm", fstr(ft_to_mm(D)), 1)
-#         return None, u"uy too small (near parallel to Y face): {:.6f}".format(uy)
-
-#     vu = unit_xy(view.UpDirection)
-#     if vu is None:
-#         f_cy_pos = 0.5*(fU + fDk)
-#         f_cy_neg = 0.5*(fU + fDk)
-#     else:
-#         if dot(cy, vu) >= 0:
-#             f_cy_pos = fU
-#             f_cy_neg = fDk
-#         else:
-#             f_cy_pos = fDk
-#             f_cy_neg = fU
-
-#     addUD = (f_cy_pos if uy >= 0 else f_cy_neg)
-#     hy = 0.5*D + addUD
-#     ty = hy / abs(uy)
-
-#     if dbg:
-#         dbg.section("hit.yonly")
-#         dbg.set(tag+"colId", col.Id.IntegerValue if col else None, 1)
-#         dbg.set(tag+"u", vstr(u), 2)
-#         dbg.set(tag+"cy", vstr(cy), 2)
-#         dbg.set(tag+"uy", fstr(uy), 1)
-#         dbg.set(tag+"D_mm", fstr(ft_to_mm(D)), 1)
-#         dbg.set(tag+"fU_mm", fstr(ft_to_mm(fU)), 1)
-#         dbg.set(tag+"fDk_mm", fstr(ft_to_mm(fDk)), 1)
-#         dbg.set(tag+"addUD_mm", fstr(ft_to_mm(addUD)), 1)
-#         dbg.set(tag+"hy_mm", fstr(ft_to_mm(hy)), 1)
-#         dbg.set(tag+"ty_mm", fstr(ft_to_mm(ty)), 1)
-
-#     return ty, None
 
 def mm(x_ft):
     return None if x_ft is None else ft_to_mm(x_ft)
@@ -585,9 +569,7 @@ def fmt_eq(label, expr, result_ft):
 def fmt_iw_debug_LR(side, ang, halfL_iw, halfR_iw, half_center, tanA, cosA):
     center = half_center * tanA
 
-    # 今のロジックに合わせて “符号で入替”
     if ang < 0:
-        # ang<0 のときは R2=(half - center), L2=(half + center) という形にしてるので
         R2_ft = (halfR_iw - center) * cosA
         L2_ft = (halfL_iw + center) * cosA
         exprR = u"(halfR_iw - center) * cosA"
@@ -611,45 +593,6 @@ def fmt_iw_debug_LR(side, ang, halfL_iw, halfR_iw, half_center, tanA, cosA):
     lines.append(u"[{}] center_offset={:.3f}mm".format(side, mm(center)))
 
     return u"\n".join(lines), L2_ft, R2_ft, center
-
-
-# def fmt_iw_debug(side, ang, half_iw, half_center, tanA, cosA):
-#     # side: "i" or "j"（表示用）
-#     # 戻り: 複数行文字列（warnsに突っ込む用）
-#     center = half_center * tanA
-
-#     # 角度符号で左右の式が入れ替わる（あなたの現行ロジック）
-#     if ang < 0:
-#         R2_ft = (half_iw - center) * cosA
-#         L2_ft = (half_iw + center) * cosA
-#         exprR = u"(half_iw - center) * cosA"
-#         exprL = u"(half_iw + center) * cosA"
-#     else:
-#         L2_ft = (half_iw - center) * cosA
-#         R2_ft = (half_iw + center) * cosA
-#         exprL = u"(half_iw - center) * cosA"
-#         exprR = u"(half_iw + center) * cosA"
-
-#     lines = []
-#     lines.append(u"[{}] ang={:.3f}deg tanA={:.6f} cosA={:.6f}".format(
-#         side, math.degrees(ang), tanA, cosA
-#     ))
-#     lines.append(u"[{}] half_center={:.3f}mm half_iw={:.3f}mm center=half_center*tanA={:.3f}mm".format(
-#         side, mm(half_center), mm(half_iw), mm(center)
-#     ))
-#     # 数値入りの“展開式”を作る
-#     lines.append(fmt_eq(u"[{}] iw_L2".format(side),
-#                         u"{} = ({:.3f} -/+ {:.3f}) * {:.6f}".format(exprL, mm(half_iw), mm(center), cosA),
-#                         L2_ft))
-#     lines.append(fmt_eq(u"[{}] iw_R2".format(side),
-#                         u"{} = ({:.3f} -/+ {:.3f}) * {:.6f}".format(exprR, mm(half_iw), mm(center), cosA),
-#                         R2_ft))
-#     lines.append(u"[{}] center_offset={:.3f}mm".format(side, mm(center)))
-
-#     # 警告に欲しいのが “iw_L2/R2 と center_offset” だけならここまででOK
-#     return u"\n".join(lines), L2_ft, R2_ft, center
-
-
 
 
 def unjoin_with_columns(doc, fi, cols):
@@ -817,9 +760,14 @@ with revit.Transaction(u"TaperBeam Auto Params"):
             # L（柱面〜柱面）：柱中心間 - (中心→面)×2
             # =========================================================
             center_len = (to_xy(Cj) - to_xy(Ci)).GetLength()
+            u_i = ex_axis
+            u_j = XYZ(-ex_axis.X, -ex_axis.Y, 0.0)
 
-            h_i, err_hi = col_hit_face_dist_along_u_Auto(i_col, ex_axis, view, dbg=dbg, tag="i.")
-            h_j, err_hj = col_hit_face_dist_along_u_Auto(j_col, ex_axis, view, dbg=dbg, tag="j.")
+            h_i, hc_i, add_i, err_hi = col_hit_face_dist_along_u_Auto(i_col, u_i, view, dbg=dbg, tag="i.")
+            h_j, hc_j, add_j, err_hj = col_hit_face_dist_along_u_Auto(j_col, u_j, view, dbg=dbg, tag="j.")
+
+            # h_i, err_hi = col_hit_face_dist_along_u_Auto(i_col, ex_axis, view, dbg=dbg, tag="i.")
+            # h_j, err_hj = col_hit_face_dist_along_u_Auto(j_col, ex_axis, view, dbg=dbg, tag="j.")
 
             dbg.section("hit")
             dbg.set("center_len_mm", fstr(ft_to_mm(center_len)), 1)
@@ -837,6 +785,7 @@ with revit.Transaction(u"TaperBeam Auto Params"):
             plan_face_len = center_len - h_i - h_j
 
             dbg.section("L")
+            dbg.set("center_len_mm", fstr(ft_to_mm(center_len)), 1)
             dbg.set("plan_face_len_mm", fstr(ft_to_mm(plan_face_len)), 1)
 
             if plan_face_len <= 1e-9:
@@ -845,11 +794,187 @@ with revit.Transaction(u"TaperBeam Auto Params"):
                     ft_to_mm(center_len), ft_to_mm(h_i), ft_to_mm(h_j)
                 ))
                 continue
+
+            erLc = set_double(fi, P_L_CENTER, center_len)
+            erLf = set_double(fi, P_L_FACE, plan_face_len)
+
+            if erLc:
+                warns.append(u"id={0}: L_center write {1}".format(fi.Id.IntegerValue, erLc))
+            if erLf:
+                warns.append(u"id={0}: L_face write {1}".format(fi.Id.IntegerValue, erLf))
+
+            try:
+                doc.Regenerate()
+            except:
+                pass
+
+            vLc, eLc = get_double(fi, P_L_CENTER)
+            vLf, eLf = get_double(fi, P_L_FACE)
+
+            dbg.section("L.new.readback")
+            dbg.set("L_center_write_err", erLc, 1)
+            dbg.set("L_face_write_err", erLf, 1)
+            dbg.set("L_center_read_err", eLc, 1)
+            dbg.set("L_face_read_err", eLf, 1)
+            dbg.set("L_center_read_mm", fstr(ft_to_mm(vLc) if vLc is not None else None), 1)
+            dbg.set("L_face_read_mm", fstr(ft_to_mm(vLf) if vLf is not None else None), 1)
+
+            # ---------------------------------------------------------
+            # 柱芯基準に矯正
+            # ---------------------------------------------------------
+            try:
+                # join/cutback の影響を減らす
+                dbg.section("endjoin.apply")
+                try:
+                    StructuralFramingUtils.DisallowJoinAtEnd(fi, 0)
+                    dbg.set("disallow_join_0", "ok", 1)
+                except Exception as ex0:
+                    dbg.set("disallow_join_0", "ng: {}".format(ex0), 1)
+
+                try:
+                    StructuralFramingUtils.DisallowJoinAtEnd(fi, 1)
+                    dbg.set("disallow_join_1", "ok", 1)
+                except Exception as ex1:
+                    dbg.set("disallow_join_1", "ng: {}".format(ex1), 1)
+
+                z0 = i_pt.Z  # 既存梁のZを維持
+                Ci3 = XYZ(Ci.X, Ci.Y, z0)
+                Cj3 = XYZ(Cj.X, Cj.Y, z0)
+
+                fi.Location.Curve = Line.CreateBound(Ci3, Cj3)
+                doc.Regenerate()
+
+                dbg.section("loc.fix")
+                dbg.set("set_curve_Ci", vstr(Ci3), 1)
+                dbg.set("set_curve_Cj", vstr(Cj3), 1)
+
+            except Exception as ex_loc:
+                warns.append(u"id={0}: LocationCurve柱芯矯正失敗 {1}".format(fi.Id.IntegerValue, ex_loc))
+            # --- write ---
             er = set_double(fi, P_I_COL_OFFSET, h_i)
             if er:
                 warns.append(u"id={0}: i_column_offset write {1}".format(fi.Id.IntegerValue, er))
+            er = set_double(fi, P_J_COL_OFFSET, h_j)
+            if er:
+                warns.append(u"id={0}: j_column_offset write {1}".format(fi.Id.IntegerValue, er))
 
+            try:
+                doc.Regenerate()
+            except:
+                pass
 
+            # offset書込後にもう一度 join禁止
+            dbg.section("endjoin.apply.after_offset")
+            try:
+                StructuralFramingUtils.DisallowJoinAtEnd(fi, 0)
+                dbg.set("disallow_join_0_after_offset", "ok", 1)
+            except Exception as ex0b:
+                dbg.set("disallow_join_0_after_offset", "ng: {}".format(ex0b), 1)
+
+            try:
+                StructuralFramingUtils.DisallowJoinAtEnd(fi, 1)
+                dbg.set("disallow_join_1_after_offset", "ok", 1)
+            except Exception as ex1b:
+                dbg.set("disallow_join_1_after_offset", "ng: {}".format(ex1b), 1)
+
+            # --- cutback / join を最後に再度つぶす ---
+            def try_set_zero(elem, names):
+                for nm in names:
+                    try:
+                        p = elem.LookupParameter(nm)
+                        if p and (not p.IsReadOnly) and p.StorageType == StorageType.Double:
+                            p.Set(0.0)
+                            return nm
+                    except:
+                        pass
+                return None
+
+            dbg.section("endfix")
+
+            # 延長ゼロ
+            nm_s_ext = try_set_zero(fi, [u"始端延長", u"Start Extension"])
+            nm_e_ext = try_set_zero(fi, [u"終端延長", u"End Extension"])
+
+            # カットバックゼロ
+            nm_s_cb = try_set_zero(fi, [u"始点カットバック", u"始端カットバック", u"Start Join Cutback", u"Start Cutback"])
+            nm_e_cb = try_set_zero(fi, [u"終点カットバック", u"終端カットバック", u"End Join Cutback", u"End Cutback"])
+
+            dbg.set("start_ext_param", nm_s_ext, 1)
+            dbg.set("end_ext_param", nm_e_ext, 1)
+            dbg.set("start_cutback_param", nm_s_cb, 1)
+            dbg.set("end_cutback_param", nm_e_cb, 1)
+
+            # 柱とのjoinを最後にもう一度解除
+            unjoin_with_columns(doc, fi, [i_col, j_col])
+
+            try:
+                doc.Regenerate()
+            except:
+                pass            
+            # --- cutback / join を最後に再度つぶす ---
+            def try_set_zero(elem, names):
+                for nm in names:
+                    try:
+                        p = elem.LookupParameter(nm)
+                        if p and (not p.IsReadOnly) and p.StorageType == StorageType.Double:
+                            p.Set(0.0)
+                            return nm
+                    except:
+                        pass
+                return None
+
+            dbg.section("endfix")
+
+            # 延長ゼロ
+            nm_s_ext = try_set_zero(fi, [u"始端延長", u"Start Extension"])
+            nm_e_ext = try_set_zero(fi, [u"終端延長", u"End Extension"])
+
+            # カットバックゼロ
+            nm_s_cb = try_set_zero(fi, [u"始点カットバック", u"始端カットバック", u"Start Join Cutback", u"Start Cutback"])
+            nm_e_cb = try_set_zero(fi, [u"終点カットバック", u"終端カットバック", u"End Join Cutback", u"End Cutback"])
+
+            dbg.set("start_ext_param", nm_s_ext, 1)
+            dbg.set("end_ext_param", nm_e_ext, 1)
+            dbg.set("start_cutback_param", nm_s_cb, 1)
+            dbg.set("end_cutback_param", nm_e_cb, 1)
+
+            try:
+                doc.Regenerate()
+            except:
+                pass
+
+            # 柱とのjoinを最後にもう一度解除
+            unjoin_with_columns(doc, fi, [i_col, j_col])
+
+            try:
+                StructuralFramingUtils.DisallowJoinAtEnd(fi, 0)
+                StructuralFramingUtils.DisallowJoinAtEnd(fi, 1)
+            except:
+                pass
+
+            try:
+                doc.Regenerate()
+            except:
+                pass
+
+            try:
+                dbg.section("endjoin.state")
+                dbg.set("allows_join_0", str(StructuralFramingUtils.AllowsJoinAtEnd(fi, 0)), 1)
+                dbg.set("allows_join_1", str(StructuralFramingUtils.AllowsJoinAtEnd(fi, 1)), 1)
+            except Exception as exj:
+                dbg.set("join_state_err", str(exj), 1)
+
+            # --- readback ---
+            v_i, e_i = get_double(fi, P_I_COL_OFFSET)
+            v_j, e_j = get_double(fi, P_J_COL_OFFSET)
+
+            dbg.section("offset.readback")
+            dbg.set("i_col_offset_write_mm", fstr(ft_to_mm(h_i)), 1)
+            dbg.set("j_col_offset_write_mm", fstr(ft_to_mm(h_j)), 1)
+            dbg.set("i_col_offset_read_mm", fstr(ft_to_mm(v_i) if v_i is not None else None), 1)
+            dbg.set("j_col_offset_read_mm", fstr(ft_to_mm(v_j) if v_j is not None else None), 1)
+            dbg.set("i_col_offset_err", e_i, 1)
+            dbg.set("j_col_offset_err", e_j, 1)
 
             # 柱サイズ（記録用）
             face_i_auto = column_face_size_from_type(i_col, ey_axis)
@@ -873,84 +998,99 @@ with revit.Transaction(u"TaperBeam Auto Params"):
             # ---- i側 ----  (LRフカシ込み + 式展開ログ)
             # =========================================================
             vals_i = None
+            err2 = None
 
             B_i, D_i, Bsrc_i, Dsrc_i = get_col_bd(i_col)
             origin_i = fmt_halves_origin("i", i_col, B_i, D_i, Bsrc_i, Dsrc_i)
 
-            half_center_i, halfL_iw_i, halfR_iw_i, err2 = get_halves_center_and_iw_LR_with_fukashi(
-                i_col, ey_axis,
-                u"フカシ01", u"フカシ02",
-                dbg=dbg, tag="i."
-            )
-
             dbg.section("equations")
             dbg.set("i.origin", origin_i, 1)
 
-            if err2:
-                warns.append(u"id={0}: i側 halves fail {1}".format(fi.Id.IntegerValue, err2))
-                dbg.set("i.err", err2, 1)
-            else:
-                # 式展開ログ ＋ 実計算（iw_L2/iw_R2/center_offset）
-                eq_i, iw_L2, iw_R2, center_i = fmt_iw_debug_LR(
-                    "i",
-                    ang,
-                    halfL_iw_i, halfR_iw_i,
-                    half_center_i,
-                    tanA, cosA
-                )
-
-                dbg.set("i.eq", eq_i, 1)
-
-                # 書き戻し用
-                vals_i = {
-                    "L2": iw_L2,
-                    "R2": iw_R2,
-                    "center_offset": center_i,
-                }
-
-            # =========================================================
-            # ---- j側 ----  (LRフカシ込み + 式展開ログ)
-            # =========================================================
-            vals_j = None
-
-            B_j, D_j, Bsrc_j, Dsrc_j = get_col_bd(j_col)
-            origin_j = fmt_halves_origin("j", j_col, B_j, D_j, Bsrc_j, Dsrc_j)
-
-            half_center_j, halfL_jw_j, halfR_jw_j, err2 = get_halves_center_and_iw_LR_with_fukashi(
-                j_col, ey_axis,
-                u"フカシ03", u"フカシ04",
-                dbg=dbg, tag="j."
+            fL_i_name, fR_i_name, err_fk_i = resolve_fukashi_names_by_ey(
+                i_col, ey_axis, dbg=dbg, tag="i."
             )
 
-            dbg.section("equations")
-            dbg.set("j.origin", origin_j, 1)
-
-            if err2:
-                warns.append(u"id={0}: j側 halves fail {1}".format(fi.Id.IntegerValue, err2))
-                dbg.set("j.err", err2, 1)
+            if err_fk_i:
+                warns.append(u"id={0}: i側 fukashi resolve fail {1}".format(fi.Id.IntegerValue, err_fk_i))
             else:
-                ang_j = -ang  # ★j側だけ符号反転（±centerの割当を逆にする）
-
-                eq_j, jw_L2, jw_R2, center_j = fmt_iw_debug_LR(
-                    "j",
-                    ang_j,  # ★ここだけ ang じゃなく ang_j
-                    halfL_jw_j, halfR_jw_j,
-                    half_center_j,
-                    tanA, cosA
+                half_center_i, halfL_iw_i, halfR_iw_i, err2 = get_halves_center_and_iw_LR_with_fukashi(
+                    i_col, ey_axis,
+                    fL_i_name, fR_i_name,
+                    dbg=dbg, tag="i."
                 )
 
-                dbg.set("j.eq", eq_j, 1)
-                dbg.set("j.ang_used_deg", fstr(math.degrees(ang_j)), 1)
+                if err2:
+                    warns.append(u"id={0}: i側 halves fail {1}".format(fi.Id.IntegerValue, err2))
+                    dbg.set("i.err", err2, 1)
+                else:
+                    half_center_i_eff = half_center_i + add_i
 
-                vals_j = {
-                    "L2": jw_L2,
-                    "R2": jw_R2,
-                    "center_offset": center_j,
-                }
+                    eq_i, iw_L2, iw_R2, center_i = fmt_iw_debug_LR(
+                        "i",
+                        ang,
+                        halfL_iw_i, halfR_iw_i,
+                        half_center_i_eff,
+                        tanA, cosA
+                    )
 
+                    dbg.set("i.eq", eq_i, 1)
 
+                    vals_i = {
+                        "L2": iw_L2,
+                        "R2": iw_R2,
+                        "center_offset": center_i,
+                    }
 
-            # 延長はゼロ（元コード踏襲）
+                # =========================================================
+                # ---- j側 ----  (LRフカシ込み + 式展開ログ)
+                # =========================================================
+                vals_j = None
+                err2 = None
+
+                B_j, D_j, Bsrc_j, Dsrc_j = get_col_bd(j_col)
+                origin_j = fmt_halves_origin("j", j_col, B_j, D_j, Bsrc_j, Dsrc_j)
+
+                dbg.section("equations")
+                dbg.set("j.origin", origin_j, 1)
+
+                fL_j_name, fR_j_name, err_fk_j = resolve_fukashi_names_by_ey(
+                    j_col, ey_axis, dbg=dbg, tag="j."
+                )
+
+                if err_fk_j:
+                    warns.append(u"id={0}: j側 fukashi resolve fail {1}".format(fi.Id.IntegerValue, err_fk_j))
+                else:
+                    half_center_j, halfL_jw_j, halfR_jw_j, err2 = get_halves_center_and_iw_LR_with_fukashi(
+                        j_col, ey_axis,
+                        fL_j_name, fR_j_name,
+                        dbg=dbg, tag="j."
+                    )
+
+                    if err2:
+                        warns.append(u"id={0}: j側 halves fail {1}".format(fi.Id.IntegerValue, err2))
+                        dbg.set("j.err", err2, 1)
+                    else:
+                        half_center_j_eff = half_center_j + add_j
+                        ang_j = -ang
+
+                        eq_j, jw_L2, jw_R2, center_j = fmt_iw_debug_LR(
+                            "j",
+                            ang_j,
+                            halfL_jw_j, halfR_jw_j,
+                            half_center_j_eff,
+                            tanA, cosA
+                        )
+
+                        dbg.set("j.eq", eq_j, 1)
+                        dbg.set("j.ang_used_deg", fstr(math.degrees(ang_j)), 1)
+
+                        vals_j = {
+                            "L2": jw_L2,
+                            "R2": jw_R2,
+                            "center_offset": center_j,
+                        }
+
+            # 延長はゼロ
             try:
                 p_s = fi.LookupParameter(u"始端延長")
                 p_e = fi.LookupParameter(u"終端延長")
@@ -965,10 +1105,10 @@ with revit.Transaction(u"TaperBeam Auto Params"):
             # WRITE BACK
             # --------------------------------------------------------
             if not DEBUG_ONLY:
-                # L（あなたの独自パラ）
-                er = set_double(fi, P_BEAM_LEN, plan_face_len)
-                if er:
-                    warns.append(u"id={0}: L書込 {1}".format(fi.Id.IntegerValue, er))
+                # # L
+                # er = set_double(fi, P_BEAM_LEN, plan_face_len)
+                # if er:
+                #     warns.append(u"id={0}: L書込 {1}".format(fi.Id.IntegerValue, er))
 
                 # 柱サイズ（記録）
                 if face_i_auto is not None:
